@@ -7,7 +7,10 @@ import { ITINERARY, INITIAL_BOOKINGS, PACKING_LIST_INITIAL, GUIDE_SPOTS, FIREBAS
 import { initializeApp, getApps, getApp } from 'firebase/app';
 // @ts-ignore
 import type { FirebaseApp } from 'firebase/app';
-import { getFirestore, doc, onSnapshot, setDoc, updateDoc, deleteField } from 'firebase/firestore';
+import { 
+  getFirestore, doc, onSnapshot, setDoc, updateDoc, deleteField, 
+  collection, deleteDoc, writeBatch, getDoc 
+} from 'firebase/firestore';
 import type { Firestore } from 'firebase/firestore';
 
 // --- Local Storage Keys ---
@@ -24,14 +27,11 @@ const STORAGE_KEYS = {
 
 // Document IDs in Firestore
 const DOC_MAIN = 'tokyo_trip_2025_shared';       // Itinerary, Lists
-const DOC_BOOKINGS = 'tokyo_trip_2025_bookings'; // Bookings
-const DOC_PHOTOS = 'tokyo_trip_2025_photos';     // Photos
-const DOC_GUIDES_OLD_LEGACY = 'tokyo_trip_2025_guides'; // Old single file (for migration)
-
-// Guide Data Sharding (Split by Day)
-// Format: tokyo_trip_2025_guides_{MMDD}
+// Legacy Docs (for migration)
+const DOC_BOOKINGS_LEGACY = 'tokyo_trip_2025_bookings'; 
+const DOC_PHOTOS_LEGACY = 'tokyo_trip_2025_photos';     
 const GUIDE_DOC_PREFIX = 'tokyo_trip_2025_guides_';
-const GUIDE_BUCKETS = ['1217', '1218', '1219', '1220', '1221', '1222', 'misc'];
+const GUIDE_BUCKETS_LEGACY = ['1217', '1218', '1219', '1220', '1221', '1222', 'misc'];
 
 // --- Image Compression Utility ---
 export const compressImage = async (base64Str: string): Promise<string> => {
@@ -43,8 +43,8 @@ export const compressImage = async (base64Str: string): Promise<string> => {
       let width = img.width;
       let height = img.height;
       
-      // Limit max dimension to 800px to save space
-      const MAX_DIMENSION = 800;
+      // More aggressive compression for mobile sync safety
+      const MAX_DIMENSION = 600;
 
       if (width > height) {
         if (width > MAX_DIMENSION) {
@@ -62,11 +62,10 @@ export const compressImage = async (base64Str: string): Promise<string> => {
       const ctx = canvas.getContext('2d');
       ctx?.drawImage(img, 0, 0, width, height);
       
-      // Compress to JPEG with 0.6 quality
-      resolve(canvas.toDataURL('image/jpeg', 0.6));
+      // Compress to JPEG with 0.5 quality
+      resolve(canvas.toDataURL('image/jpeg', 0.5));
     };
     img.onerror = () => {
-        // Fallback if image load fails
         resolve(base64Str);
     }
   });
@@ -94,23 +93,29 @@ interface TripContextType {
   // Actions
   setItinerary: (data: DaySchedule[]) => void;
   updateItineraryItem: (dayIndex: number, items: ItineraryItem[]) => void;
-  setBookings: (data: BookingItem[]) => void;
+  
+  setBookings: (data: BookingItem[]) => void; // Legacy signature support
   addBooking: (item: BookingItem) => void;
   deleteBooking: (id: string) => void;
   updateBookingPhoto: (id: string, base64: string) => void;
+  
   addGuideSpot: (item: GuideLocation) => void;
   deleteGuideSpot: (id: string) => void;
   updateGuideSpot: (item: GuideLocation) => void;
+  
   setPackingList: (data: PackingItem[]) => void;
   togglePackingItem: (id: string) => void;
+  
   setMemoList: (data: PackingItem[]) => void;
   addMemoItem: (item: PackingItem) => void;
   deleteMemoItem: (id: string) => void;
   toggleMemoItem: (id: string) => void;
+  
   setWishList: (data: PackingItem[]) => void;
   addWishItem: (item: PackingItem) => void;
   deleteWishItem: (id: string) => void;
   toggleWishItem: (id: string) => void;
+  
   uploadPhoto: (key: string, base64: string) => void;
   removePhoto: (key: string) => void;
   
@@ -143,11 +148,6 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const appRef = useRef<any>(null);
   const dbRef = useRef<Firestore | null>(null);
   const unsubscribeRef = useRef<(() => void) | null>(null);
-  
-  // Ref to hold partial guide data from different buckets before merging
-  const guideChunksRef = useRef<Record<string, GuideLocation[]>>({});
-  
-  // A ref to block snapshot updates temporarily if we know a write failed
   const ignoreNextSnapshot = useRef<boolean>(false);
 
   // --- Data State ---
@@ -166,30 +166,83 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }));
   };
 
-  // --- Utility: Get Bucket for Date ---
-  const getGuideBucket = (dateStr?: string): string => {
-      if (!dateStr) return 'misc';
-      // Normalize: '2025-12-17' -> '1217', '12/17' -> '1217'
-      let clean = dateStr
-          .replace('2025/', '')
-          .replace('2025-', '')
-          .replace('/', '')
-          .replace('-', ''); // Remove separators and year
+  // --- Migration Logic ---
+  const performMigration = async (db: Firestore) => {
+      console.log("Checking for legacy data migration...");
+      const batch = writeBatch(db);
+      let migrationNeeded = false;
 
-      // Extract last 4 chars if longer (e.g. 1217)
-      if (clean.length > 4) clean = clean.slice(-4);
-      
-      if (GUIDE_BUCKETS.includes(clean)) return clean;
-      return 'misc';
+      // 1. Migrate Bookings (Doc -> Subcollection)
+      try {
+          const bookingDocRef = doc(db, 'trips', DOC_BOOKINGS_LEGACY);
+          const bookingSnap = await getDoc(bookingDocRef);
+          if (bookingSnap.exists()) {
+              const data = bookingSnap.data();
+              if (data.bookings && Array.isArray(data.bookings) && data.bookings.length > 0) {
+                  console.log(`Migrating ${data.bookings.length} bookings...`);
+                  data.bookings.forEach((b: BookingItem) => {
+                      const newRef = doc(db, 'trips', DOC_MAIN, 'bookings', b.id);
+                      batch.set(newRef, b);
+                  });
+                  batch.delete(bookingDocRef);
+                  migrationNeeded = true;
+              }
+          }
+      } catch (e) { console.warn("Booking migration check failed", e); }
+
+      // 2. Migrate Guides (Buckets -> Subcollection)
+      for (const bucket of GUIDE_BUCKETS_LEGACY) {
+          try {
+              const guideRef = doc(db, 'trips', `${GUIDE_DOC_PREFIX}${bucket}`);
+              const guideSnap = await getDoc(guideRef);
+              if (guideSnap.exists()) {
+                  const data = guideSnap.data();
+                  if (data.guideSpots && Array.isArray(data.guideSpots) && data.guideSpots.length > 0) {
+                       console.log(`Migrating guides from bucket ${bucket}...`);
+                       data.guideSpots.forEach((g: GuideLocation) => {
+                           const newRef = doc(db, 'trips', DOC_MAIN, 'guides', g.id);
+                           batch.set(newRef, g);
+                       });
+                       batch.delete(guideRef);
+                       migrationNeeded = true;
+                  }
+              }
+          } catch (e) { console.warn(`Guide bucket ${bucket} migration check failed`, e); }
+      }
+
+      // 3. Migrate Photos (Doc -> Subcollection)
+      try {
+          const photoDocRef = doc(db, 'trips', DOC_PHOTOS_LEGACY);
+          const photoSnap = await getDoc(photoDocRef);
+          if (photoSnap.exists()) {
+              const data = photoSnap.data();
+              if (data.photos) {
+                  console.log("Migrating photos...");
+                  Object.entries(data.photos).forEach(([key, base64]) => {
+                      const newRef = doc(db, 'trips', DOC_MAIN, 'memories', key);
+                      batch.set(newRef, { id: key, data: base64 });
+                  });
+                  batch.delete(photoDocRef);
+                  migrationNeeded = true;
+              }
+          }
+      } catch (e) { console.warn("Photo migration check failed", e); }
+
+      if (migrationNeeded) {
+          await batch.commit();
+          console.log("Migration completed successfully.");
+      } else {
+          console.log("No migration needed.");
+      }
   };
 
   // --- Cloud Logic ---
   const handleFirestoreError = (err: any) => {
       console.error("Firebase Error:", err);
-      if (err.code === 'permission-denied') {
+      if (err.code === 'resource-exhausted') {
+          setError("資料過大，請嘗試刪除部分圖片");
+      } else if (err.code === 'permission-denied') {
           setError("連線失敗：權限不足");
-      } else if (err.code === 'unavailable') {
-          setError("連線失敗：網路不穩");
       } else {
           setError(`連線中斷: ${err.message}`);
       }
@@ -200,7 +253,7 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       if (connectionStatus === 'connected' || connectionStatus === 'connecting') return;
 
       setConnectionStatus('connecting');
-      console.log("Starting Firebase connection...");
+      console.log("Starting Firebase connection (Sub-collection Mode)...");
 
       try {
           // 1. Initialize App
@@ -216,7 +269,6 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
             }
             appRef.current = app;
           } catch (initErr: any) {
-            console.error("Firebase Init Error:", initErr);
             throw new Error(`初始化失敗: ${initErr.message}`);
           }
 
@@ -224,16 +276,14 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           const db = getFirestore(app);
           dbRef.current = db;
 
-          // Reset Chunks on Connect
-          guideChunksRef.current = {};
-          GUIDE_BUCKETS.forEach(b => guideChunksRef.current[b] = []);
+          // 3. Perform Migration (One-time check)
+          await performMigration(db);
 
           const unsubs: (() => void)[] = [];
 
           // --- Listener 1: Main (Itinerary & Lists) ---
           const mainRef = doc(db, 'trips', DOC_MAIN);
-          const unsubMain = onSnapshot(mainRef, async (docSnap) => {
-             if (connectionStatus === 'error' && !isCloudMode) return;
+          const unsubMain = onSnapshot(mainRef, (docSnap) => {
              if (ignoreNextSnapshot.current) { ignoreNextSnapshot.current = false; return; }
 
              if (docSnap.exists()) {
@@ -242,50 +292,12 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
                  if (data.packingList) setPackingListState(data.packingList);
                  if (data.memoList) setMemoListState(data.memoList);
                  if (data.wishList) setWishListState(data.wishList);
-                 
-                 // Migration Check (Move heavy items out of MAIN)
-                 const updatesToMove: any = {};
-                 const updatesToDelete: any = {};
-                 let needMainUpdate = false;
-                 
-                 if (data.bookings) {
-                     await setDoc(doc(db, 'trips', DOC_BOOKINGS), { bookings: data.bookings }, { merge: true });
-                     updatesToDelete.bookings = deleteField();
-                     needMainUpdate = true;
-                 }
-                 if (data.photos) {
-                     await setDoc(doc(db, 'trips', DOC_PHOTOS), { photos: data.photos }, { merge: true });
-                     updatesToDelete.photos = deleteField();
-                     needMainUpdate = true;
-                 }
-                 // If old guides are in main
-                 if (data.guideSpots) {
-                     // Distribute to buckets
-                     const oldGuides = data.guideSpots as GuideLocation[];
-                     const buckets: Record<string, GuideLocation[]> = {};
-                     oldGuides.forEach(g => {
-                         const b = getGuideBucket(g.date);
-                         if (!buckets[b]) buckets[b] = [];
-                         buckets[b].push(g);
-                     });
-                     // Save to buckets
-                     for (const [bKey, items] of Object.entries(buckets)) {
-                         await setDoc(doc(db, 'trips', `${GUIDE_DOC_PREFIX}${bKey}`), { guideSpots: items }, { merge: true });
-                     }
-                     updatesToDelete.guideSpots = deleteField();
-                     needMainUpdate = true;
-                 }
-
-                 if (needMainUpdate) {
-                     console.log("Migrating data from Main...");
-                     await updateDoc(mainRef, updatesToDelete);
-                 }
                  setError(null);
              } else {
                  setDoc(mainRef, { 
                     itinerary: sanitizeForFirestore(itinerary), 
                     packingList, memoList, wishList 
-                 }, { merge: true }).catch(err => setError(`建立資料失敗: ${err.message}`));
+                 }, { merge: true }).catch(console.error);
              }
              setConnectionStatus('connected');
              setIsCloudMode(true);
@@ -294,92 +306,50 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           }, handleFirestoreError);
           unsubs.push(unsubMain);
 
-          // --- Listener 2: Bookings ---
-          const bookingsRef = doc(db, 'trips', DOC_BOOKINGS);
-          const unsubBookings = onSnapshot(bookingsRef, (docSnap) => {
-              if (docSnap.exists()) {
-                  const data = docSnap.data();
-                  if (data.bookings) setBookingsState(data.bookings);
-              } else {
-                  setDoc(bookingsRef, { bookings: sanitizeForFirestore(bookings) }, { merge: true }).catch(console.error);
-              }
-          }, (err) => console.warn("Bookings sync error:", err.message));
-          unsubs.push(unsubBookings);
-
-          // --- Listener 3: Photos ---
-          const photosRef = doc(db, 'trips', DOC_PHOTOS);
-          const unsubPhotos = onSnapshot(photosRef, (docSnap) => {
-              if (docSnap.exists()) {
-                  const data = docSnap.data();
-                  if (data.photos) setPhotosState(data.photos);
-              } else {
-                  setDoc(photosRef, { photos: {} }, { merge: true }).catch(console.error);
-              }
-          }, (err) => console.warn("Photos sync error:", err.message));
-          unsubs.push(unsubPhotos);
-
-          // --- Listener 4: Guides (Multi-Bucket Aggregation) ---
-          
-          // Helper to merge all buckets
-          const updateGuideStateFromChunks = () => {
-              const allSpots = Object.values(guideChunksRef.current).flat();
-              // Sort by date then id to keep consistent order
-              allSpots.sort((a, b) => {
+          // --- Listener 2: Guides (Sub-collection) ---
+          const guidesRef = collection(db, 'trips', DOC_MAIN, 'guides');
+          const unsubGuides = onSnapshot(guidesRef, (snapshot) => {
+              const loadedGuides: GuideLocation[] = [];
+              snapshot.forEach(doc => {
+                  loadedGuides.push(doc.data() as GuideLocation);
+              });
+              // Sort by date then id
+              loadedGuides.sort((a, b) => {
                   if (a.date !== b.date) return (a.date || '').localeCompare(b.date || '');
                   return a.id.localeCompare(b.id);
               });
-              setGuideSpotsState(allSpots);
-          };
+              setGuideSpotsState(loadedGuides);
+              // Also update local storage for offline use
+              localStorage.setItem(STORAGE_KEYS.GUIDES, JSON.stringify(loadedGuides));
+          }, handleFirestoreError);
+          unsubs.push(unsubGuides);
 
-          // 4.1 Listen to Legacy Guide Doc (Migration only)
-          const oldGuidesRef = doc(db, 'trips', DOC_GUIDES_OLD_LEGACY);
-          const unsubOldGuides = onSnapshot(oldGuidesRef, async (docSnap) => {
-             if (docSnap.exists()) {
-                 const data = docSnap.data();
-                 if (data.guideSpots && data.guideSpots.length > 0) {
-                     console.log("Migrating legacy Guide document to daily buckets...");
-                     const oldList = data.guideSpots as GuideLocation[];
-                     const buckets: Record<string, GuideLocation[]> = {};
-                     
-                     oldList.forEach(g => {
-                         const b = getGuideBucket(g.date);
-                         if (!buckets[b]) buckets[b] = [];
-                         buckets[b].push(g);
-                     });
+          // --- Listener 3: Bookings (Sub-collection) ---
+          const bookingsRef = collection(db, 'trips', DOC_MAIN, 'bookings');
+          const unsubBookings = onSnapshot(bookingsRef, (snapshot) => {
+              const loadedBookings: BookingItem[] = [];
+              snapshot.forEach(doc => {
+                  loadedBookings.push(doc.data() as BookingItem);
+              });
+              setBookingsState(loadedBookings);
+              localStorage.setItem(STORAGE_KEYS.BOOKINGS, JSON.stringify(loadedBookings));
+          }, handleFirestoreError);
+          unsubs.push(unsubBookings);
 
-                     // Write to new buckets
-                     for (const [bKey, items] of Object.entries(buckets)) {
-                         const bucketRef = doc(db, 'trips', `${GUIDE_DOC_PREFIX}${bKey}`);
-                         await setDoc(bucketRef, { guideSpots: items }, { merge: true });
-                     }
-
-                     // Delete old doc contents
-                     await updateDoc(oldGuidesRef, { guideSpots: deleteField() });
-                 }
-             } 
-          });
-          unsubs.push(unsubOldGuides);
-
-          // 4.2 Listen to All Date Buckets
-          GUIDE_BUCKETS.forEach(bucketKey => {
-             const bucketDocId = `${GUIDE_DOC_PREFIX}${bucketKey}`;
-             const bucketRef = doc(db, 'trips', bucketDocId);
-             
-             const unsubBucket = onSnapshot(bucketRef, (docSnap) => {
-                 if (docSnap.exists()) {
-                     const data = docSnap.data();
-                     // Update local chunk cache
-                     guideChunksRef.current[bucketKey] = data.guideSpots || [];
-                 } else {
-                     // If bucket doesn't exist, we assume empty for this bucket
-                     // (Don't create empty docs unnecessarily to save writes, unless saving)
-                     guideChunksRef.current[bucketKey] = [];
-                 }
-                 updateGuideStateFromChunks();
-             }, (err) => console.warn(`Guide bucket ${bucketKey} sync error:`, err.message));
-             
-             unsubs.push(unsubBucket);
-          });
+          // --- Listener 4: Memories/Photos (Sub-collection) ---
+          const memoriesRef = collection(db, 'trips', DOC_MAIN, 'memories');
+          const unsubMemories = onSnapshot(memoriesRef, (snapshot) => {
+              const loadedPhotos: Record<string, string> = {};
+              snapshot.forEach(doc => {
+                  const d = doc.data();
+                  if (d.id && d.data) {
+                      loadedPhotos[d.id] = d.data;
+                  }
+              });
+              setPhotosState(loadedPhotos);
+              localStorage.setItem(STORAGE_KEYS.PHOTOS, JSON.stringify(loadedPhotos));
+          }, handleFirestoreError);
+          unsubs.push(unsubMemories);
 
           unsubscribeRef.current = () => {
               unsubs.forEach(u => u());
@@ -397,136 +367,54 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         unsubscribeRef.current();
         unsubscribeRef.current = null;
     }
-    guideChunksRef.current = {}; // Clear chunks on disconnect
     setConnectionStatus('disconnected');
     setIsCloudMode(false);
   };
 
-  // --- Persistence ---
-  const persist = async (key: string, data: any, fieldName: string) => {
-      // 1. Local
+  // --- Helpers for Persistence ---
+  
+  // Save specific item to subcollection
+  const saveToCloudSub = async (collectionName: 'guides' | 'bookings' | 'memories', id: string, data: any) => {
+      if (!isCloudMode || !dbRef.current) return;
       try {
-          localStorage.setItem(key, JSON.stringify(data));
-      } catch (e) {
-          console.error("Local Save Error:", e);
-      }
-
-      // 2. Cloud
-      if (isCloudMode && dbRef.current && connectionStatus === 'connected') {
-          const cleanData = sanitizeForFirestore(data);
-          
-          try {
-              if (fieldName === 'guideSpots') {
-                  // Special Handling for Guides: Split by Date
-                  const allSpots = cleanData as GuideLocation[];
-                  const buckets: Record<string, GuideLocation[]> = {};
-                  
-                  // Initialize buckets empty
-                  GUIDE_BUCKETS.forEach(b => buckets[b] = []);
-
-                  // Distribute
-                  allSpots.forEach(spot => {
-                      const b = getGuideBucket(spot.date);
-                      if (buckets[b]) buckets[b].push(spot);
-                      else buckets['misc'].push(spot);
-                  });
-
-                  // Write all buckets (using setDoc to overwrite array for that day)
-                  const writePromises = Object.entries(buckets).map(([bKey, items]) => {
-                       const docRef = doc(dbRef.current!, 'trips', `${GUIDE_DOC_PREFIX}${bKey}`);
-                       // Using setDoc without merge because we want to overwrite the list for this bucket
-                       // This handles deletions correctly
-                       return setDoc(docRef, { guideSpots: items });
-                  });
-                  
-                  await Promise.all(writePromises);
-
-              } else {
-                  // Standard Handling
-                  let targetDocId = DOC_MAIN;
-                  if (fieldName === 'bookings') targetDocId = DOC_BOOKINGS;
-                  else if (fieldName === 'photos') targetDocId = DOC_PHOTOS;
-                  
-                  const docRef = doc(dbRef.current, 'trips', targetDocId);
-                  
-                  // For Main doc, protect against jitter
-                  if (targetDocId === DOC_MAIN) ignoreNextSnapshot.current = true;
-                  
-                  // Use setDoc with merge: true instead of updateDoc
-                  // This ensures the document is created if it doesn't exist (e.g., syncing from a new device)
-                  await setDoc(docRef, { [fieldName]: cleanData }, { merge: true });
-              }
-
-              if (error && error.includes('失敗')) setError(null);
-
-          } catch (err: any) {
-              console.error("Cloud Save Error:", err);
-              if (fieldName !== 'guideSpots' && fieldName !== 'photos') {
-                   // Release lock if failed
-                   ignoreNextSnapshot.current = false; 
-              }
-              
-              let msg = "儲存失敗";
-              if (err.code === 'resource-exhausted') msg = "儲存空間不足 (檔案過大)，請嘗試刪除舊圖片";
-              else if (err.code === 'permission-denied') msg = "無寫入權限";
-              else msg = `儲存失敗: ${err.message}`;
-              
-              setError(msg);
-          }
+          const ref = doc(dbRef.current, 'trips', DOC_MAIN, collectionName, id);
+          await setDoc(ref, sanitizeForFirestore(data));
+      } catch (e: any) {
+          console.error(`Save to ${collectionName} failed:`, e);
+          if (e.code === 'resource-exhausted') setError("圖片過大無法上傳");
       }
   };
 
-  // --- Initialization ---
-  useEffect(() => {
-    const initData = async () => {
-      // Load Local Storage
+  const deleteFromCloudSub = async (collectionName: 'guides' | 'bookings' | 'memories', id: string) => {
+      if (!isCloudMode || !dbRef.current) return;
       try {
-          const localItinerary = localStorage.getItem(STORAGE_KEYS.ITINERARY);
-          if (localItinerary) setItineraryState(JSON.parse(localItinerary));
-
-          const localBookings = localStorage.getItem(STORAGE_KEYS.BOOKINGS);
-          if (localBookings) setBookingsState(JSON.parse(localBookings));
-
-          const localGuides = localStorage.getItem(STORAGE_KEYS.GUIDES);
-          if (localGuides) setGuideSpotsState(JSON.parse(localGuides));
-
-          const localPacking = localStorage.getItem(STORAGE_KEYS.PACKING);
-          if (localPacking) setPackingListState(JSON.parse(localPacking));
-          
-          const localMemo = localStorage.getItem(STORAGE_KEYS.MEMO);
-          if (localMemo) setMemoListState(JSON.parse(localMemo));
-          
-          const localWish = localStorage.getItem(STORAGE_KEYS.WISH);
-          if (localWish) setWishListState(JSON.parse(localWish));
-
-          const localPhotos = localStorage.getItem(STORAGE_KEYS.PHOTOS);
-          if (localPhotos) setPhotosState(JSON.parse(localPhotos));
+          const ref = doc(dbRef.current, 'trips', DOC_MAIN, collectionName, id);
+          await deleteDoc(ref);
       } catch (e) {
-          console.error("Failed to load local data", e);
+          console.error(`Delete from ${collectionName} failed:`, e);
       }
+  };
 
-      // Auto Connect Cloud
-      // Prioritize Code Config
-      if (FIREBASE_CONFIG.apiKey && !FIREBASE_CONFIG.apiKey.includes("請填入")) {
-          await connectToCloud(FIREBASE_CONFIG);
-      } else {
-          // Fallback to stored config
-          const storedConfig = localStorage.getItem(STORAGE_KEYS.FIREBASE_CONFIG);
-          if (storedConfig) {
-             try {
-                await connectToCloud(JSON.parse(storedConfig));
-             } catch { /* ignore */ }
-          }
+  // Save main doc fields
+  const saveMainDoc = async (field: string, data: any) => {
+      if (!isCloudMode || !dbRef.current) return;
+      try {
+          ignoreNextSnapshot.current = true;
+          const ref = doc(dbRef.current, 'trips', DOC_MAIN);
+          await setDoc(ref, { [field]: sanitizeForFirestore(data) }, { merge: true });
+      } catch (e) {
+          ignoreNextSnapshot.current = false;
+          console.error(`Save main doc ${field} failed:`, e);
       }
-      setIsLoading(false);
-    };
+  };
 
-    initData();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // --- Actions Implementation ---
 
-  // --- Actions ---
-  const setItinerary = (data: DaySchedule[]) => { setItineraryState(data); persist(STORAGE_KEYS.ITINERARY, data, 'itinerary'); };
+  const setItinerary = (data: DaySchedule[]) => { 
+      setItineraryState(data); 
+      localStorage.setItem(STORAGE_KEYS.ITINERARY, JSON.stringify(data));
+      saveMainDoc('itinerary', data);
+  };
   
   const updateItineraryItem = (dayIndex: number, items: ItineraryItem[]) => {
     const newData = [...itinerary];
@@ -534,49 +422,77 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     setItinerary(newData);
   };
 
-  const setBookings = (data: BookingItem[]) => { setBookingsState(data); persist(STORAGE_KEYS.BOOKINGS, data, 'bookings'); };
-  
+  // Bookings
+  const setBookings = (data: BookingItem[]) => {
+      // This legacy function is tricky with subcollections. 
+      // We should ideally not use setBookings(array) for cloud sync unless we overwrite everything.
+      // For now, we update local state.
+      setBookingsState(data);
+      localStorage.setItem(STORAGE_KEYS.BOOKINGS, JSON.stringify(data));
+  };
+
   const addBooking = (item: BookingItem) => {
-    const newData = [...bookings, item];
-    setBookings(newData);
+      const newData = [...bookings, item];
+      setBookingsState(newData);
+      localStorage.setItem(STORAGE_KEYS.BOOKINGS, JSON.stringify(newData));
+      saveToCloudSub('bookings', item.id, item);
   };
 
   const deleteBooking = (id: string) => {
-    const newData = bookings.filter(b => b.id !== id);
-    setBookings(newData);
+      const newData = bookings.filter(b => b.id !== id);
+      setBookingsState(newData);
+      localStorage.setItem(STORAGE_KEYS.BOOKINGS, JSON.stringify(newData));
+      deleteFromCloudSub('bookings', id);
   };
 
   const updateBookingPhoto = (id: string, base64: string) => {
-    const newData = bookings.map(b => b.id === id ? { ...b, imageUrl: base64 } : b);
-    setBookings(newData);
+      const newData = bookings.map(b => b.id === id ? { ...b, imageUrl: base64 } : b);
+      setBookingsState(newData);
+      localStorage.setItem(STORAGE_KEYS.BOOKINGS, JSON.stringify(newData));
+      
+      const item = newData.find(b => b.id === id);
+      if (item) saveToCloudSub('bookings', item.id, item);
   };
 
-  // Guides logic wrapper
-  const setGuideSpots = (data: GuideLocation[]) => { setGuideSpotsState(data); persist(STORAGE_KEYS.GUIDES, data, 'guideSpots'); };
-  
+  // Guide Spots
   const addGuideSpot = (item: GuideLocation) => {
-    const newData = [...guideSpots, item];
-    setGuideSpots(newData);
+      const newData = [...guideSpots, item];
+      setGuideSpotsState(newData);
+      localStorage.setItem(STORAGE_KEYS.GUIDES, JSON.stringify(newData));
+      saveToCloudSub('guides', item.id, item);
   };
 
   const deleteGuideSpot = (id: string) => {
-    const newData = guideSpots.filter(g => g.id !== id);
-    setGuideSpots(newData);
+      const newData = guideSpots.filter(g => g.id !== id);
+      setGuideSpotsState(newData);
+      localStorage.setItem(STORAGE_KEYS.GUIDES, JSON.stringify(newData));
+      deleteFromCloudSub('guides', id);
   };
 
   const updateGuideSpot = (item: GuideLocation) => {
-    const newData = guideSpots.map(g => g.id === item.id ? item : g);
-    setGuideSpots(newData);
+      const newData = guideSpots.map(g => g.id === item.id ? item : g);
+      setGuideSpotsState(newData);
+      localStorage.setItem(STORAGE_KEYS.GUIDES, JSON.stringify(newData));
+      saveToCloudSub('guides', item.id, item);
   };
 
-  const setPackingList = (data: PackingItem[]) => { setPackingListState(data); persist(STORAGE_KEYS.PACKING, data, 'packingList'); };
+  // Lists
+  const setPackingList = (data: PackingItem[]) => { 
+      setPackingListState(data); 
+      localStorage.setItem(STORAGE_KEYS.PACKING, JSON.stringify(data));
+      saveMainDoc('packingList', data);
+  };
   
   const togglePackingItem = (id: string) => {
     const newData = packingList.map(item => item.id === id ? { ...item, checked: !item.checked } : item);
     setPackingList(newData);
   };
 
-  const setMemoList = (data: PackingItem[]) => { setMemoListState(data); persist(STORAGE_KEYS.MEMO, data, 'memoList'); };
+  const setMemoList = (data: PackingItem[]) => { 
+      setMemoListState(data); 
+      localStorage.setItem(STORAGE_KEYS.MEMO, JSON.stringify(data));
+      saveMainDoc('memoList', data);
+  };
   
   const addMemoItem = (item: PackingItem) => {
     const newData = [...memoList, item];
@@ -593,7 +509,11 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     setMemoList(newData);
   };
 
-  const setWishList = (data: PackingItem[]) => { setWishListState(data); persist(STORAGE_KEYS.WISH, data, 'wishList'); };
+  const setWishList = (data: PackingItem[]) => { 
+      setWishListState(data); 
+      localStorage.setItem(STORAGE_KEYS.WISH, JSON.stringify(data));
+      saveMainDoc('wishList', data);
+  };
   
   const addWishItem = (item: PackingItem) => {
     const newData = [...wishList, item];
@@ -610,17 +530,20 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     setWishList(newData);
   };
 
+  // Photos (Memories)
   const uploadPhoto = (key: string, base64: string) => {
       const newPhotos = { ...photos, [key]: base64 };
       setPhotosState(newPhotos);
-      persist(STORAGE_KEYS.PHOTOS, newPhotos, 'photos');
+      localStorage.setItem(STORAGE_KEYS.PHOTOS, JSON.stringify(newPhotos));
+      saveToCloudSub('memories', key, { id: key, data: base64 });
   };
 
   const removePhoto = (key: string) => {
       const newPhotos = { ...photos };
       delete newPhotos[key];
       setPhotosState(newPhotos);
-      persist(STORAGE_KEYS.PHOTOS, newPhotos, 'photos');
+      localStorage.setItem(STORAGE_KEYS.PHOTOS, JSON.stringify(newPhotos));
+      deleteFromCloudSub('memories', key);
   };
 
   // Export / Import
@@ -651,21 +574,77 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           const data = JSON.parse(jsonString);
           
           if (data[STORAGE_KEYS.ITINERARY]) setItinerary(data[STORAGE_KEYS.ITINERARY]);
-          if (data[STORAGE_KEYS.BOOKINGS]) setBookings(data[STORAGE_KEYS.BOOKINGS]);
-          if (data[STORAGE_KEYS.GUIDES]) setGuideSpots(data[STORAGE_KEYS.GUIDES]);
+          
+          // For subcollection items, we update local state.
+          // If connected to cloud, we should ideally trigger writes for all of them,
+          // but that might be heavy. For now, import updates LOCAL state primarily.
+          // If user wants to sync imported data to cloud, they'd effectively need to "touch" items or we'd need a batch upload feature.
+          if (data[STORAGE_KEYS.BOOKINGS]) setBookingsState(data[STORAGE_KEYS.BOOKINGS]);
+          if (data[STORAGE_KEYS.GUIDES]) setGuideSpotsState(data[STORAGE_KEYS.GUIDES]);
+          if (data[STORAGE_KEYS.PHOTOS]) setPhotosState(data[STORAGE_KEYS.PHOTOS]);
+          
           if (data[STORAGE_KEYS.PACKING]) setPackingList(data[STORAGE_KEYS.PACKING]);
           if (data[STORAGE_KEYS.MEMO]) setMemoList(data[STORAGE_KEYS.MEMO]);
           if (data[STORAGE_KEYS.WISH]) setWishList(data[STORAGE_KEYS.WISH]);
-          if (data[STORAGE_KEYS.PHOTOS]) {
-              setPhotosState(data[STORAGE_KEYS.PHOTOS]);
-              persist(STORAGE_KEYS.PHOTOS, data[STORAGE_KEYS.PHOTOS], 'photos');
-          }
+          
+          // Save all to local
+          Object.keys(data).forEach(k => {
+              localStorage.setItem(k, JSON.stringify(data[k]));
+          });
+          
           return true;
       } catch (e) {
           console.error("Import Error:", e);
           return false;
       }
   };
+
+  // Initialization
+  useEffect(() => {
+    const initData = async () => {
+      // Load Local Storage
+      try {
+          const localItinerary = localStorage.getItem(STORAGE_KEYS.ITINERARY);
+          if (localItinerary) setItineraryState(JSON.parse(localItinerary));
+
+          const localBookings = localStorage.getItem(STORAGE_KEYS.BOOKINGS);
+          if (localBookings) setBookingsState(JSON.parse(localBookings));
+
+          const localGuides = localStorage.getItem(STORAGE_KEYS.GUIDES);
+          if (localGuides) setGuideSpotsState(JSON.parse(localGuides));
+
+          const localPacking = localStorage.getItem(STORAGE_KEYS.PACKING);
+          if (localPacking) setPackingListState(JSON.parse(localPacking));
+          
+          const localMemo = localStorage.getItem(STORAGE_KEYS.MEMO);
+          if (localMemo) setMemoListState(JSON.parse(localMemo));
+          
+          const localWish = localStorage.getItem(STORAGE_KEYS.WISH);
+          if (localWish) setWishListState(JSON.parse(localWish));
+
+          const localPhotos = localStorage.getItem(STORAGE_KEYS.PHOTOS);
+          if (localPhotos) setPhotosState(JSON.parse(localPhotos));
+      } catch (e) {
+          console.error("Failed to load local data", e);
+      }
+
+      // Auto Connect Cloud
+      if (FIREBASE_CONFIG.apiKey && !FIREBASE_CONFIG.apiKey.includes("請填入")) {
+          await connectToCloud(FIREBASE_CONFIG);
+      } else {
+          const storedConfig = localStorage.getItem(STORAGE_KEYS.FIREBASE_CONFIG);
+          if (storedConfig) {
+             try {
+                await connectToCloud(JSON.parse(storedConfig));
+             } catch { /* ignore */ }
+          }
+      }
+      setIsLoading(false);
+    };
+
+    initData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <TripContext.Provider value={{
