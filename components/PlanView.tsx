@@ -3,6 +3,7 @@ import { GUIDE_SPOTS } from '../constants';
 import { ItineraryItem, Tab } from '../types';
 import { MapPin, Plane, Coffee, BedDouble, AlertCircle, Utensils, CloudRain, Sun, Cloud, Clock, X, Image as ImageIcon, Upload, TrainFront, Lock, Unlock, Trash2, Plus, BookOpen, Ticket, Sparkles, LayoutList, Pencil, Check, RotateCcw } from 'lucide-react';
 import { useTripContext } from '../contexts/TripContext';
+import { compressImage } from '../contexts/TripContext'; // Import helper
 
 const PIN_CODE = '0000';
 
@@ -123,20 +124,17 @@ const DetailModal: React.FC<DetailModalProps> = ({ item, dayDate, onClose, onNav
 
   const isBookingLink = !item.linkTo && (item.type === 'hotel' || item.type === 'food');
 
-  const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      if (file.size > 500 * 1024) {
-         alert("圖片大小超過 500KB，請選擇較小的圖片！");
-         return;
-      }
       const reader = new FileReader();
-      reader.onloadend = () => {
+      reader.onloadend = async () => {
         const result = reader.result as string;
         try {
-            uploadPhoto(photoKey, result);
+            const compressed = await compressImage(result);
+            uploadPhoto(photoKey, compressed);
         } catch (error) {
-            alert("上傳失敗，請重試！");
+            alert("圖片處理失敗！");
         }
       };
       reader.readAsDataURL(file);
@@ -306,7 +304,7 @@ const DetailModal: React.FC<DetailModalProps> = ({ item, dayDate, onClose, onNav
             ) : (
                 <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-stone-300 rounded-xl bg-stone-50 cursor-pointer hover:bg-stone-100 transition-colors">
                     <Upload size={24} className="text-stone-400 mb-2" />
-                    <span className="text-sm text-stone-500 font-medium">上傳照片</span>
+                    <span className="text-sm text-stone-500 font-medium">上傳照片 (自動壓縮)</span>
                     <input type="file" accept="image/*" className="hidden" onChange={handlePhotoUpload} />
                 </label>
             )}
