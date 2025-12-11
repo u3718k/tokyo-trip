@@ -2,11 +2,12 @@ import React, { createContext, useContext, useState, useEffect, ReactNode, useRe
 import { DaySchedule, BookingItem, PackingItem, ItineraryItem, GuideLocation } from '../types';
 import { ITINERARY, INITIAL_BOOKINGS, PACKING_LIST_INITIAL, GUIDE_SPOTS, FIREBASE_CONFIG } from '../constants';
 
-// Standard Modular SDK Imports (Best for Vite + Firebase v9/v10)
-// Using separate type imports to ensure compatibility across different TS configurations
+// Standard Modular SDK Imports
+// @ts-ignore
 import { initializeApp, getApps, getApp } from 'firebase/app';
+// @ts-ignore
 import type { FirebaseApp } from 'firebase/app';
-import { getFirestore, doc, onSnapshot, setDoc, updateDoc } from 'firebase/firestore';
+import { getFirestore, doc, onSnapshot, setDoc, updateDoc, deleteField } from 'firebase/firestore';
 import type { Firestore } from 'firebase/firestore';
 
 // --- Local Storage Keys ---
@@ -21,8 +22,16 @@ const STORAGE_KEYS = {
   FIREBASE_CONFIG: 'trip_firebase_config'
 };
 
-// Document ID in Firestore
-const CLOUD_DOC_ID = 'tokyo_trip_2025_shared';
+// Document IDs in Firestore
+const DOC_MAIN = 'tokyo_trip_2025_shared';       // Itinerary, Lists
+const DOC_BOOKINGS = 'tokyo_trip_2025_bookings'; // Bookings
+const DOC_PHOTOS = 'tokyo_trip_2025_photos';     // Photos
+const DOC_GUIDES_OLD_LEGACY = 'tokyo_trip_2025_guides'; // Old single file (for migration)
+
+// Guide Data Sharding (Split by Day)
+// Format: tokyo_trip_2025_guides_{MMDD}
+const GUIDE_DOC_PREFIX = 'tokyo_trip_2025_guides_';
+const GUIDE_BUCKETS = ['1217', '1218', '1219', '1220', '1221', '1222', 'misc'];
 
 interface FirebaseConfig {
   apiKey: string;
@@ -92,9 +101,12 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
   
   // Firebase Refs
-  const appRef = useRef<FirebaseApp | null>(null);
+  const appRef = useRef<any>(null);
   const dbRef = useRef<Firestore | null>(null);
   const unsubscribeRef = useRef<(() => void) | null>(null);
+  
+  // Ref to hold partial guide data from different buckets before merging
+  const guideChunksRef = useRef<Record<string, GuideLocation[]>>({});
   
   // A ref to block snapshot updates temporarily if we know a write failed
   const ignoreNextSnapshot = useRef<boolean>(false);
@@ -115,7 +127,28 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }));
   };
 
+  // --- Utility: Get Bucket for Date ---
+  const getGuideBucket = (dateStr?: string): string => {
+      if (!dateStr) return 'misc';
+      // dateStr format: '12/17' or '2025/12/17'
+      const clean = dateStr.replace('2025/', '').replace('/', ''); // '1217'
+      if (GUIDE_BUCKETS.includes(clean)) return clean;
+      return 'misc';
+  };
+
   // --- Cloud Logic ---
+  const handleFirestoreError = (err: any) => {
+      console.error("Firebase Error:", err);
+      if (err.code === 'permission-denied') {
+          setError("連線失敗：權限不足");
+      } else if (err.code === 'unavailable') {
+          setError("連線失敗：網路不穩");
+      } else {
+          setError(`連線中斷: ${err.message}`);
+      }
+      setConnectionStatus('error');
+  };
+
   const connectToCloud = async (config: FirebaseConfig) => {
       if (connectionStatus === 'connected' || connectionStatus === 'connecting') return;
 
@@ -124,11 +157,14 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
       try {
           // 1. Initialize App
-          let app: FirebaseApp;
+          let app: any;
           try {
+            // @ts-ignore
             if (getApps().length === 0) {
+              // @ts-ignore
               app = initializeApp(config);
             } else {
+              // @ts-ignore
               app = getApp();
             }
             appRef.current = app;
@@ -141,64 +177,162 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           const db = getFirestore(app);
           dbRef.current = db;
 
-          // 3. Set up Listener
-          const docRef = doc(db, 'trips', CLOUD_DOC_ID);
-          
-          const unsubscribe = onSnapshot(docRef, (docSnap) => {
-             if (connectionStatus === 'error' && !isCloudMode) return; // Ignore if previously errored out locally
-             
-             // Prevent rollback loop
-             if (ignoreNextSnapshot.current) {
-                 console.log("Ignoring snapshot due to recent write failure");
-                 ignoreNextSnapshot.current = false;
-                 return;
-             }
+          const unsubs: (() => void)[] = [];
+
+          // --- Listener 1: Main (Itinerary & Lists) ---
+          const mainRef = doc(db, 'trips', DOC_MAIN);
+          const unsubMain = onSnapshot(mainRef, async (docSnap) => {
+             if (connectionStatus === 'error' && !isCloudMode) return;
+             if (ignoreNextSnapshot.current) { ignoreNextSnapshot.current = false; return; }
 
              if (docSnap.exists()) {
                  const data = docSnap.data();
-                 console.log("Data received from cloud");
                  if (data.itinerary) setItineraryState(data.itinerary);
-                 if (data.bookings) setBookingsState(data.bookings);
-                 if (data.guideSpots) setGuideSpotsState(data.guideSpots);
                  if (data.packingList) setPackingListState(data.packingList);
                  if (data.memoList) setMemoListState(data.memoList);
                  if (data.wishList) setWishListState(data.wishList);
-                 if (data.photos) setPhotosState(data.photos);
+                 
+                 // Migration Check (Move heavy items out of MAIN)
+                 const updatesToMove: any = {};
+                 const updatesToDelete: any = {};
+                 let needMainUpdate = false;
+                 
+                 if (data.bookings) {
+                     await setDoc(doc(db, 'trips', DOC_BOOKINGS), { bookings: data.bookings }, { merge: true });
+                     updatesToDelete.bookings = deleteField();
+                     needMainUpdate = true;
+                 }
+                 if (data.photos) {
+                     await setDoc(doc(db, 'trips', DOC_PHOTOS), { photos: data.photos }, { merge: true });
+                     updatesToDelete.photos = deleteField();
+                     needMainUpdate = true;
+                 }
+                 // If old guides are in main
+                 if (data.guideSpots) {
+                     // Distribute to buckets
+                     const oldGuides = data.guideSpots as GuideLocation[];
+                     const buckets: Record<string, GuideLocation[]> = {};
+                     oldGuides.forEach(g => {
+                         const b = getGuideBucket(g.date);
+                         if (!buckets[b]) buckets[b] = [];
+                         buckets[b].push(g);
+                     });
+                     // Save to buckets
+                     for (const [bKey, items] of Object.entries(buckets)) {
+                         await setDoc(doc(db, 'trips', `${GUIDE_DOC_PREFIX}${bKey}`), { guideSpots: items }, { merge: true });
+                     }
+                     updatesToDelete.guideSpots = deleteField();
+                     needMainUpdate = true;
+                 }
+
+                 if (needMainUpdate) {
+                     console.log("Migrating data from Main...");
+                     await updateDoc(mainRef, updatesToDelete);
+                 }
                  setError(null);
              } else {
-                 console.log("Creating new document in cloud...");
-                 const cleanItinerary = sanitizeForFirestore(itinerary);
-                 const cleanBookings = sanitizeForFirestore(bookings);
-                 const cleanGuides = sanitizeForFirestore(guideSpots);
-                 
-                 setDoc(docRef, {
-                    itinerary: cleanItinerary, 
-                    bookings: cleanBookings, 
-                    guideSpots: cleanGuides, 
-                    packingList, memoList, wishList, photos
-                 }).catch(err => {
-                    console.error("Create Doc Error:", err);
-                    setError(`建立資料失敗: ${err.message}`);
-                 });
+                 setDoc(mainRef, { 
+                    itinerary: sanitizeForFirestore(itinerary), 
+                    packingList, memoList, wishList 
+                 }).catch(err => setError(`建立資料失敗: ${err.message}`));
              }
              setConnectionStatus('connected');
              setIsCloudMode(true);
              setCloudConfig(config);
              localStorage.setItem(STORAGE_KEYS.FIREBASE_CONFIG, JSON.stringify(config));
-          }, (err) => {
-              console.error("Firebase Snapshot Error:", err);
-              // Common Firestore Errors
-              if (err.code === 'permission-denied') {
-                  setError("連線失敗：權限不足 (Permission Denied)");
-              } else if (err.code === 'unavailable') {
-                  setError("連線失敗：網路不穩或服務離線");
+          }, handleFirestoreError);
+          unsubs.push(unsubMain);
+
+          // --- Listener 2: Bookings ---
+          const bookingsRef = doc(db, 'trips', DOC_BOOKINGS);
+          const unsubBookings = onSnapshot(bookingsRef, (docSnap) => {
+              if (docSnap.exists()) {
+                  const data = docSnap.data();
+                  if (data.bookings) setBookingsState(data.bookings);
               } else {
-                  setError(`連線中斷: ${err.message}`);
+                  setDoc(bookingsRef, { bookings: sanitizeForFirestore(bookings) }).catch(console.error);
               }
-              setConnectionStatus('error');
+          }, (err) => console.warn("Bookings sync error:", err.message));
+          unsubs.push(unsubBookings);
+
+          // --- Listener 3: Photos ---
+          const photosRef = doc(db, 'trips', DOC_PHOTOS);
+          const unsubPhotos = onSnapshot(photosRef, (docSnap) => {
+              if (docSnap.exists()) {
+                  const data = docSnap.data();
+                  if (data.photos) setPhotosState(data.photos);
+              } else {
+                  setDoc(photosRef, { photos: {} }).catch(console.error);
+              }
+          }, (err) => console.warn("Photos sync error:", err.message));
+          unsubs.push(unsubPhotos);
+
+          // --- Listener 4: Guides (Multi-Bucket Aggregation) ---
+          
+          // Helper to merge all buckets
+          const updateGuideStateFromChunks = () => {
+              const allSpots = Object.values(guideChunksRef.current).flat();
+              // Sort by date then id to keep consistent order
+              allSpots.sort((a, b) => {
+                  if (a.date !== b.date) return (a.date || '').localeCompare(b.date || '');
+                  return a.id.localeCompare(b.id);
+              });
+              setGuideSpotsState(allSpots);
+          };
+
+          // 4.1 Listen to Legacy Guide Doc (Migration only)
+          const oldGuidesRef = doc(db, 'trips', DOC_GUIDES_OLD_LEGACY);
+          const unsubOldGuides = onSnapshot(oldGuidesRef, async (docSnap) => {
+             if (docSnap.exists()) {
+                 const data = docSnap.data();
+                 if (data.guideSpots && data.guideSpots.length > 0) {
+                     console.log("Migrating legacy Guide document to daily buckets...");
+                     const oldList = data.guideSpots as GuideLocation[];
+                     const buckets: Record<string, GuideLocation[]> = {};
+                     
+                     oldList.forEach(g => {
+                         const b = getGuideBucket(g.date);
+                         if (!buckets[b]) buckets[b] = [];
+                         buckets[b].push(g);
+                     });
+
+                     // Write to new buckets
+                     for (const [bKey, items] of Object.entries(buckets)) {
+                         const bucketRef = doc(db, 'trips', `${GUIDE_DOC_PREFIX}${bKey}`);
+                         await setDoc(bucketRef, { guideSpots: items }, { merge: true });
+                     }
+
+                     // Delete old doc contents
+                     await updateDoc(oldGuidesRef, { guideSpots: deleteField() });
+                 }
+             } 
+          });
+          unsubs.push(unsubOldGuides);
+
+          // 4.2 Listen to All Date Buckets
+          GUIDE_BUCKETS.forEach(bucketKey => {
+             const bucketDocId = `${GUIDE_DOC_PREFIX}${bucketKey}`;
+             const bucketRef = doc(db, 'trips', bucketDocId);
+             
+             const unsubBucket = onSnapshot(bucketRef, (docSnap) => {
+                 if (docSnap.exists()) {
+                     const data = docSnap.data();
+                     // Update local chunk cache
+                     guideChunksRef.current[bucketKey] = data.guideSpots || [];
+                 } else {
+                     // If bucket doesn't exist, we assume empty for this bucket
+                     // (Don't create empty docs unnecessarily to save writes, unless saving)
+                     guideChunksRef.current[bucketKey] = [];
+                 }
+                 updateGuideStateFromChunks();
+             }, (err) => console.warn(`Guide bucket ${bucketKey} sync error:`, err.message));
+             
+             unsubs.push(unsubBucket);
           });
 
-          unsubscribeRef.current = unsubscribe;
+          unsubscribeRef.current = () => {
+              unsubs.forEach(u => u());
+          };
 
       } catch (e: any) {
           console.error("Firebase Connection Exception:", e);
@@ -208,55 +342,13 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   };
 
   const disconnectCloud = () => {
-      if (unsubscribeRef.current) unsubscribeRef.current();
-      setIsCloudMode(false);
-      setConnectionStatus('disconnected');
-      appRef.current = null;
-      dbRef.current = null;
+    if (unsubscribeRef.current) {
+        unsubscribeRef.current();
+        unsubscribeRef.current = null;
+    }
+    setConnectionStatus('disconnected');
+    setIsCloudMode(false);
   };
-
-  // --- Initialization ---
-  useEffect(() => {
-      // 1. Load Local Data
-      try {
-          const load = <T,>(key: string, fallback: T): T => {
-              const stored = localStorage.getItem(key);
-              return stored ? JSON.parse(stored) : fallback;
-          };
-
-          setItineraryState(load(STORAGE_KEYS.ITINERARY, ITINERARY));
-          setBookingsState(load(STORAGE_KEYS.BOOKINGS, INITIAL_BOOKINGS));
-          setGuideSpotsState(load(STORAGE_KEYS.GUIDES, GUIDE_SPOTS));
-          setPackingListState(load(STORAGE_KEYS.PACKING, PACKING_LIST_INITIAL.map(t => ({ id: t, text: t, checked: false }))));
-          setMemoListState(load(STORAGE_KEYS.MEMO, []));
-          setWishListState(load(STORAGE_KEYS.WISH, []));
-          setPhotosState(load(STORAGE_KEYS.PHOTOS, {}));
-
-          // 2. Auto Connect
-          const isHardcodedConfigValid = FIREBASE_CONFIG.apiKey && !FIREBASE_CONFIG.apiKey.includes("請填入");
-          
-          if (isHardcodedConfigValid) {
-              connectToCloud(FIREBASE_CONFIG);
-          } else {
-              const savedConfig = localStorage.getItem(STORAGE_KEYS.FIREBASE_CONFIG);
-              if (savedConfig) {
-                  const config = JSON.parse(savedConfig);
-                  setCloudConfig(config);
-                  connectToCloud(config);
-              }
-          }
-
-      } catch (e) {
-          console.error("Initialization Error:", e);
-          setError("載入資料失敗");
-      } finally {
-          setIsLoading(false);
-      }
-      
-      return () => {
-          if (unsubscribeRef.current) unsubscribeRef.current();
-      };
-  }, []);
 
   // --- Persistence ---
   const persist = async (key: string, data: any, fieldName: string) => {
@@ -269,19 +361,59 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
       // 2. Cloud
       if (isCloudMode && dbRef.current && connectionStatus === 'connected') {
-          const docRef = doc(dbRef.current, 'trips', CLOUD_DOC_ID);
+          const cleanData = sanitizeForFirestore(data);
+          
           try {
-              const cleanData = sanitizeForFirestore(data);
-              await updateDoc(docRef, { [fieldName]: cleanData });
-              
+              if (fieldName === 'guideSpots') {
+                  // Special Handling for Guides: Split by Date
+                  const allSpots = cleanData as GuideLocation[];
+                  const buckets: Record<string, GuideLocation[]> = {};
+                  
+                  // Initialize buckets empty
+                  GUIDE_BUCKETS.forEach(b => buckets[b] = []);
+
+                  // Distribute
+                  allSpots.forEach(spot => {
+                      const b = getGuideBucket(spot.date);
+                      if (buckets[b]) buckets[b].push(spot);
+                      else buckets['misc'].push(spot);
+                  });
+
+                  // Write all buckets (using setDoc to overwrite array for that day)
+                  const writePromises = Object.entries(buckets).map(([bKey, items]) => {
+                       const docRef = doc(dbRef.current!, 'trips', `${GUIDE_DOC_PREFIX}${bKey}`);
+                       // If items empty, we still write empty array to clear if needed
+                       return setDoc(docRef, { guideSpots: items });
+                  });
+                  
+                  await Promise.all(writePromises);
+
+              } else {
+                  // Standard Handling
+                  let targetDocId = DOC_MAIN;
+                  if (fieldName === 'bookings') targetDocId = DOC_BOOKINGS;
+                  else if (fieldName === 'photos') targetDocId = DOC_PHOTOS;
+                  
+                  const docRef = doc(dbRef.current, 'trips', targetDocId);
+                  
+                  // For Main doc, protect against jitter
+                  if (targetDocId === DOC_MAIN) ignoreNextSnapshot.current = true;
+                  
+                  await updateDoc(docRef, { [fieldName]: cleanData });
+              }
+
               if (error && error.includes('失敗')) setError(null);
+
           } catch (err: any) {
               console.error("Cloud Save Error:", err);
-              ignoreNextSnapshot.current = true;
+              if (fieldName !== 'guideSpots' && fieldName !== 'photos') {
+                   // Release lock if failed
+                   ignoreNextSnapshot.current = false; 
+              }
               
               let msg = "儲存失敗";
-              if (err.code === 'resource-exhausted') msg = "儲存失敗：資料過大 (圖片限制)";
-              else if (err.code === 'permission-denied') msg = "儲存失敗：無寫入權限";
+              if (err.code === 'resource-exhausted') msg = "儲存空間不足，請刪除部分圖片";
+              else if (err.code === 'permission-denied') msg = "無寫入權限";
               else msg = `儲存失敗: ${err.message}`;
               
               setError(msg);
@@ -289,7 +421,56 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       }
   };
 
-  // --- Actions (Pass through) ---
+  // --- Initialization ---
+  useEffect(() => {
+    const initData = async () => {
+      // Load Local Storage
+      try {
+          const localItinerary = localStorage.getItem(STORAGE_KEYS.ITINERARY);
+          if (localItinerary) setItineraryState(JSON.parse(localItinerary));
+
+          const localBookings = localStorage.getItem(STORAGE_KEYS.BOOKINGS);
+          if (localBookings) setBookingsState(JSON.parse(localBookings));
+
+          const localGuides = localStorage.getItem(STORAGE_KEYS.GUIDES);
+          if (localGuides) setGuideSpotsState(JSON.parse(localGuides));
+
+          const localPacking = localStorage.getItem(STORAGE_KEYS.PACKING);
+          if (localPacking) setPackingListState(JSON.parse(localPacking));
+          
+          const localMemo = localStorage.getItem(STORAGE_KEYS.MEMO);
+          if (localMemo) setMemoListState(JSON.parse(localMemo));
+          
+          const localWish = localStorage.getItem(STORAGE_KEYS.WISH);
+          if (localWish) setWishListState(JSON.parse(localWish));
+
+          const localPhotos = localStorage.getItem(STORAGE_KEYS.PHOTOS);
+          if (localPhotos) setPhotosState(JSON.parse(localPhotos));
+      } catch (e) {
+          console.error("Failed to load local data", e);
+      }
+
+      // Auto Connect Cloud
+      // Prioritize Code Config
+      if (FIREBASE_CONFIG.apiKey && !FIREBASE_CONFIG.apiKey.includes("請填入")) {
+          await connectToCloud(FIREBASE_CONFIG);
+      } else {
+          // Fallback to stored config
+          const storedConfig = localStorage.getItem(STORAGE_KEYS.FIREBASE_CONFIG);
+          if (storedConfig) {
+             try {
+                await connectToCloud(JSON.parse(storedConfig));
+             } catch { /* ignore */ }
+          }
+      }
+      setIsLoading(false);
+    };
+
+    initData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // --- Actions ---
   const setItinerary = (data: DaySchedule[]) => { setItineraryState(data); persist(STORAGE_KEYS.ITINERARY, data, 'itinerary'); };
   
   const updateItineraryItem = (dayIndex: number, items: ItineraryItem[]) => {
@@ -315,6 +496,7 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     setBookings(newData);
   };
 
+  // Guides logic wrapper
   const setGuideSpots = (data: GuideLocation[]) => { setGuideSpotsState(data); persist(STORAGE_KEYS.GUIDES, data, 'guideSpots'); };
   
   const addGuideSpot = (item: GuideLocation) => {
