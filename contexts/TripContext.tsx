@@ -33,6 +33,45 @@ const DOC_GUIDES_OLD_LEGACY = 'tokyo_trip_2025_guides'; // Old single file (for 
 const GUIDE_DOC_PREFIX = 'tokyo_trip_2025_guides_';
 const GUIDE_BUCKETS = ['1217', '1218', '1219', '1220', '1221', '1222', 'misc'];
 
+// --- Image Compression Utility ---
+export const compressImage = async (base64Str: string): Promise<string> => {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.src = base64Str;
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      let width = img.width;
+      let height = img.height;
+      
+      // Limit max dimension to 800px to save space
+      const MAX_DIMENSION = 800;
+
+      if (width > height) {
+        if (width > MAX_DIMENSION) {
+          height *= MAX_DIMENSION / width;
+          width = MAX_DIMENSION;
+        }
+      } else {
+        if (height > MAX_DIMENSION) {
+          width *= MAX_DIMENSION / height;
+          height = MAX_DIMENSION;
+        }
+      }
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx?.drawImage(img, 0, 0, width, height);
+      
+      // Compress to JPEG with 0.6 quality
+      resolve(canvas.toDataURL('image/jpeg', 0.6));
+    };
+    img.onerror = () => {
+        // Fallback if image load fails
+        resolve(base64Str);
+    }
+  });
+};
+
 interface FirebaseConfig {
   apiKey: string;
   authDomain: string;
@@ -428,7 +467,7 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
               }
               
               let msg = "儲存失敗";
-              if (err.code === 'resource-exhausted') msg = "儲存空間不足，請刪除部分圖片";
+              if (err.code === 'resource-exhausted') msg = "儲存空間不足 (檔案過大)，請嘗試刪除舊圖片";
               else if (err.code === 'permission-denied') msg = "無寫入權限";
               else msg = `儲存失敗: ${err.message}`;
               
