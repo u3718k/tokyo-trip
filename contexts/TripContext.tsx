@@ -43,8 +43,8 @@ export const compressImage = async (base64Str: string): Promise<string> => {
       let width = img.width;
       let height = img.height;
       
-      // Maximum compression for stability
-      const MAX_DIMENSION = 500;
+      // Better quality compression for good viewing experience
+      const MAX_DIMENSION = 1280;
 
       if (width > height) {
         if (width > MAX_DIMENSION) {
@@ -62,8 +62,8 @@ export const compressImage = async (base64Str: string): Promise<string> => {
       const ctx = canvas.getContext('2d');
       ctx?.drawImage(img, 0, 0, width, height);
       
-      // High compression JPEG (0.4)
-      resolve(canvas.toDataURL('image/jpeg', 0.4));
+      // Standard JPEG Quality (0.8)
+      resolve(canvas.toDataURL('image/jpeg', 0.8));
     };
     img.onerror = () => {
         resolve(base64Str);
