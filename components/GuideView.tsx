@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useTripContext } from '../contexts/TripContext';
+import { compressImage } from '../contexts/TripContext'; // Import helper
 import { GuideLocation } from '../types';
 import { Lock, Unlock, Plus, Trash2, X, Upload, MapPin, Calendar, Hash, Pencil } from 'lucide-react';
 
@@ -306,15 +307,18 @@ const GuideFormModal: React.FC<{
     const [isConfirming, setIsConfirming] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
-    const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
         if (file) {
           const reader = new FileReader();
-          reader.onloadend = () => {
+          reader.onloadend = async () => {
             try {
-                setImageUrl(reader.result as string);
+                const rawBase64 = reader.result as string;
+                // Compress before setting state
+                const compressed = await compressImage(rawBase64);
+                setImageUrl(compressed);
             } catch (error) {
-                alert("圖片過大！");
+                alert("圖片處理失敗！");
             }
           };
           reader.readAsDataURL(file);
@@ -399,7 +403,7 @@ const GuideFormModal: React.FC<{
                         <input value={tagInput} onChange={e => setTagInput(e.target.value)} className="w-full p-3 rounded-xl border border-stone-200 bg-stone-50" placeholder="美食, 夜景, 購物" />
                     </div>
                     <div>
-                        <label className="text-xs font-bold text-stone-500 block mb-1">封面照片</label>
+                        <label className="text-xs font-bold text-stone-500 block mb-1">封面照片 (自動壓縮)</label>
                         <label className="flex items-center gap-3 p-3 rounded-xl border border-dashed border-stone-300 bg-stone-50 cursor-pointer hover:bg-stone-100">
                             <Upload size={20} className="text-stone-400" />
                             <span className="text-sm text-stone-500 truncate">{imageUrl ? '圖片已選取' : '上傳圖片'}</span>
