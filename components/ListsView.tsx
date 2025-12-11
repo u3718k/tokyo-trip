@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { CheckSquare, Square, Plus, Trash2, Link as LinkIcon, AlertTriangle, Check, X, Download, Upload, Cloud, PlugZap, Loader2, CloudOff, RefreshCw } from 'lucide-react';
+import { CheckSquare, Square, Plus, Trash2, Link as LinkIcon, AlertTriangle, Check, X, Download, Upload, Cloud, PlugZap, Loader2, CloudOff, RefreshCw, Trash } from 'lucide-react';
 import { PackingItem } from '../types';
 import { useTripContext } from '../contexts/TripContext';
 import { FIREBASE_CONFIG } from '../constants';
@@ -18,6 +18,7 @@ const ListsView: React.FC = () => {
   
   const [deleteConfirm, setDeleteConfirm] = useState<{id: string, type: 'memo' | 'wish'} | null>(null);
   const [isAddingConfirm, setIsAddingConfirm] = useState(false);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   
@@ -113,6 +114,14 @@ const ListsView: React.FC = () => {
           return;
       }
       handleRetryConnect();
+  };
+  
+  // New: Hard Reset Function
+  const handleHardReset = () => {
+      if (window.confirm("確定要重置嗎？\n\n這將會清除手機上的所有暫存資料，並強制從雲端重新下載。\n(不會刪除雲端上的資料)")) {
+          localStorage.clear();
+          window.location.reload();
+      }
   };
 
   const isUrl = (text: string) => {
@@ -307,6 +316,14 @@ const ListsView: React.FC = () => {
                         {connectionStatus === 'connecting' ? '連線中...' : isCloudMode ? '已連線 (點擊斷開)' : '啟用雲端同步'}
                     </button>
                  )}
+                 
+                 {/* Hard Reset Button */}
+                 <button 
+                    onClick={handleHardReset}
+                    className="w-full py-3 bg-red-50 text-red-500 rounded-xl text-xs font-bold flex items-center justify-center gap-2 active:scale-95 transition-transform border border-red-100 hover:bg-red-100 mt-2"
+                 >
+                     <RefreshCw size={14} /> 強制重置修復 (看圖片必點)
+                 </button>
                  
                  {isCloudMode && isHardcodedConfigValid && (
                      <p className="text-[10px] text-sky-400 text-center px-2">
