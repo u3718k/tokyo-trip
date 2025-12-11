@@ -1,8 +1,13 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode, useRef } from 'react';
 import { DaySchedule, BookingItem, PackingItem, ItineraryItem, GuideLocation } from '../types';
 import { ITINERARY, INITIAL_BOOKINGS, PACKING_LIST_INITIAL, GUIDE_SPOTS, FIREBASE_CONFIG } from '../constants';
-import { initializeApp, getApps, FirebaseApp } from 'firebase/app';
-import { getFirestore, doc, onSnapshot, setDoc, Firestore, updateDoc } from 'firebase/firestore';
+
+// Standard Modular SDK Imports (Best for Vite + Firebase v9/v10)
+// Using separate type imports to ensure compatibility across different TS configurations
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import type { FirebaseApp } from 'firebase/app';
+import { getFirestore, doc, onSnapshot, setDoc, updateDoc } from 'firebase/firestore';
+import type { Firestore } from 'firebase/firestore';
 
 // --- Local Storage Keys ---
 const STORAGE_KEYS = {
@@ -13,7 +18,7 @@ const STORAGE_KEYS = {
   MEMO: 'trip_memo_list',
   WISH: 'trip_wish_list',
   PHOTOS: 'trip_photos',
-  FIREBASE_CONFIG: 'trip_firebase_config' // Save config to stay logged in
+  FIREBASE_CONFIG: 'trip_firebase_config'
 };
 
 // Document ID in Firestore
@@ -90,6 +95,9 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const appRef = useRef<FirebaseApp | null>(null);
   const dbRef = useRef<Firestore | null>(null);
   const unsubscribeRef = useRef<(() => void) | null>(null);
+  
+  // A ref to block snapshot updates temporarily if we know a write failed
+  const ignoreNextSnapshot = useRef<boolean>(false);
 
   // --- Data State ---
   const [itinerary, setItineraryState] = useState<DaySchedule[]>(ITINERARY);
@@ -100,27 +108,55 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const [wishList, setWishListState] = useState<PackingItem[]>([]);
   const [photos, setPhotosState] = useState<Record<string, string>>({});
 
+  // --- Saver Helper ---
+  const sanitizeForFirestore = (obj: any): any => {
+    return JSON.parse(JSON.stringify(obj, (key, value) => {
+        return value === undefined ? null : value;
+    }));
+  };
+
   // --- Cloud Logic ---
   const connectToCloud = async (config: FirebaseConfig) => {
-      // Prevent multiple connection attempts
       if (connectionStatus === 'connected' || connectionStatus === 'connecting') return;
 
       setConnectionStatus('connecting');
+      console.log("Starting Firebase connection...");
+
       try {
-          // Initialize Firebase
-          const app = getApps().length === 0 ? initializeApp(config) : getApps()[0];
+          // 1. Initialize App
+          let app: FirebaseApp;
+          try {
+            if (getApps().length === 0) {
+              app = initializeApp(config);
+            } else {
+              app = getApp();
+            }
+            appRef.current = app;
+          } catch (initErr: any) {
+            console.error("Firebase Init Error:", initErr);
+            throw new Error(`初始化失敗: ${initErr.message}`);
+          }
+
+          // 2. Initialize Firestore
           const db = getFirestore(app);
-          
-          appRef.current = app;
           dbRef.current = db;
 
-          // Set up Real-time Listener
+          // 3. Set up Listener
           const docRef = doc(db, 'trips', CLOUD_DOC_ID);
           
           const unsubscribe = onSnapshot(docRef, (docSnap) => {
+             if (connectionStatus === 'error' && !isCloudMode) return; // Ignore if previously errored out locally
+             
+             // Prevent rollback loop
+             if (ignoreNextSnapshot.current) {
+                 console.log("Ignoring snapshot due to recent write failure");
+                 ignoreNextSnapshot.current = false;
+                 return;
+             }
+
              if (docSnap.exists()) {
                  const data = docSnap.data();
-                 // Merge cloud data to local state
+                 console.log("Data received from cloud");
                  if (data.itinerary) setItineraryState(data.itinerary);
                  if (data.bookings) setBookingsState(data.bookings);
                  if (data.guideSpots) setGuideSpotsState(data.guideSpots);
@@ -128,10 +164,21 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
                  if (data.memoList) setMemoListState(data.memoList);
                  if (data.wishList) setWishListState(data.wishList);
                  if (data.photos) setPhotosState(data.photos);
+                 setError(null);
              } else {
-                 // If doc doesn't exist, create it with current local data
+                 console.log("Creating new document in cloud...");
+                 const cleanItinerary = sanitizeForFirestore(itinerary);
+                 const cleanBookings = sanitizeForFirestore(bookings);
+                 const cleanGuides = sanitizeForFirestore(guideSpots);
+                 
                  setDoc(docRef, {
-                    itinerary, bookings, guideSpots, packingList, memoList, wishList, photos
+                    itinerary: cleanItinerary, 
+                    bookings: cleanBookings, 
+                    guideSpots: cleanGuides, 
+                    packingList, memoList, wishList, photos
+                 }).catch(err => {
+                    console.error("Create Doc Error:", err);
+                    setError(`建立資料失敗: ${err.message}`);
                  });
              }
              setConnectionStatus('connected');
@@ -140,17 +187,23 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
              localStorage.setItem(STORAGE_KEYS.FIREBASE_CONFIG, JSON.stringify(config));
           }, (err) => {
               console.error("Firebase Snapshot Error:", err);
+              // Common Firestore Errors
+              if (err.code === 'permission-denied') {
+                  setError("連線失敗：權限不足 (Permission Denied)");
+              } else if (err.code === 'unavailable') {
+                  setError("連線失敗：網路不穩或服務離線");
+              } else {
+                  setError(`連線中斷: ${err.message}`);
+              }
               setConnectionStatus('error');
-              setError("雲端同步中斷");
           });
 
           unsubscribeRef.current = unsubscribe;
 
       } catch (e: any) {
-          console.error("Firebase Connection Error:", e);
+          console.error("Firebase Connection Exception:", e);
           setConnectionStatus('error');
-          setError("無法連線到雲端資料庫");
-          // Don't re-throw here to avoid crashing the app init
+          setError(`無法連線: ${e.message}`);
       }
   };
 
@@ -158,15 +211,13 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       if (unsubscribeRef.current) unsubscribeRef.current();
       setIsCloudMode(false);
       setConnectionStatus('disconnected');
-      setCloudConfig(null);
-      localStorage.removeItem(STORAGE_KEYS.FIREBASE_CONFIG);
-      // Reload page to clear firebase instances cleanly
-      window.location.reload();
+      appRef.current = null;
+      dbRef.current = null;
   };
 
   // --- Initialization ---
   useEffect(() => {
-      // 1. Load Local Data first
+      // 1. Load Local Data
       try {
           const load = <T,>(key: string, fallback: T): T => {
               const stored = localStorage.getItem(key);
@@ -181,15 +232,12 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           setWishListState(load(STORAGE_KEYS.WISH, []));
           setPhotosState(load(STORAGE_KEYS.PHOTOS, {}));
 
-          // 2. Automatic Cloud Connection Logic
-          // Check if constants.ts has valid config
+          // 2. Auto Connect
           const isHardcodedConfigValid = FIREBASE_CONFIG.apiKey && !FIREBASE_CONFIG.apiKey.includes("請填入");
           
           if (isHardcodedConfigValid) {
-              console.log("Auto-connecting using hardcoded config...");
               connectToCloud(FIREBASE_CONFIG);
           } else {
-              // Fallback: Check local storage for manually entered config (Legacy)
               const savedConfig = localStorage.getItem(STORAGE_KEYS.FIREBASE_CONFIG);
               if (savedConfig) {
                   const config = JSON.parse(savedConfig);
@@ -210,46 +258,48 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       };
   }, []);
 
-  // --- Saver Helper ---
-  // If in cloud mode, save to Firestore. Always save to LocalStorage as backup.
-  const persist = (key: string, data: any, fieldName: string) => {
-      // 1. Local Save
+  // --- Persistence ---
+  const persist = async (key: string, data: any, fieldName: string) => {
+      // 1. Local
       try {
           localStorage.setItem(key, JSON.stringify(data));
       } catch (e) {
           console.error("Local Save Error:", e);
       }
 
-      // 2. Cloud Save (if connected)
+      // 2. Cloud
       if (isCloudMode && dbRef.current && connectionStatus === 'connected') {
           const docRef = doc(dbRef.current, 'trips', CLOUD_DOC_ID);
-          // Use updateDoc to patch only the changed field
-          updateDoc(docRef, { [fieldName]: data }).catch(err => {
+          try {
+              const cleanData = sanitizeForFirestore(data);
+              await updateDoc(docRef, { [fieldName]: cleanData });
+              
+              if (error && error.includes('失敗')) setError(null);
+          } catch (err: any) {
               console.error("Cloud Save Error:", err);
-          });
+              ignoreNextSnapshot.current = true;
+              
+              let msg = "儲存失敗";
+              if (err.code === 'resource-exhausted') msg = "儲存失敗：資料過大 (圖片限制)";
+              else if (err.code === 'permission-denied') msg = "儲存失敗：無寫入權限";
+              else msg = `儲存失敗: ${err.message}`;
+              
+              setError(msg);
+          }
       }
   };
 
-  // --- Actions (Updated to use persist) ---
-
-  // Itinerary
-  const setItinerary = (data: DaySchedule[]) => {
-    setItineraryState(data); 
-    persist(STORAGE_KEYS.ITINERARY, data, 'itinerary');
-  };
-
+  // --- Actions (Pass through) ---
+  const setItinerary = (data: DaySchedule[]) => { setItineraryState(data); persist(STORAGE_KEYS.ITINERARY, data, 'itinerary'); };
+  
   const updateItineraryItem = (dayIndex: number, items: ItineraryItem[]) => {
     const newData = [...itinerary];
     newData[dayIndex] = { ...newData[dayIndex], items: items };
     setItinerary(newData);
   };
 
-  // Bookings
-  const setBookings = (data: BookingItem[]) => {
-    setBookingsState(data);
-    persist(STORAGE_KEYS.BOOKINGS, data, 'bookings');
-  };
-
+  const setBookings = (data: BookingItem[]) => { setBookingsState(data); persist(STORAGE_KEYS.BOOKINGS, data, 'bookings'); };
+  
   const addBooking = (item: BookingItem) => {
     const newData = [...bookings, item];
     setBookings(newData);
@@ -265,12 +315,8 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     setBookings(newData);
   };
 
-  // Guide Spots
-  const setGuideSpots = (data: GuideLocation[]) => {
-      setGuideSpotsState(data);
-      persist(STORAGE_KEYS.GUIDES, data, 'guideSpots');
-  };
-
+  const setGuideSpots = (data: GuideLocation[]) => { setGuideSpotsState(data); persist(STORAGE_KEYS.GUIDES, data, 'guideSpots'); };
+  
   const addGuideSpot = (item: GuideLocation) => {
     const newData = [...guideSpots, item];
     setGuideSpots(newData);
@@ -286,22 +332,15 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     setGuideSpots(newData);
   };
 
-  // Lists
-  const setPackingList = (data: PackingItem[]) => {
-    setPackingListState(data);
-    persist(STORAGE_KEYS.PACKING, data, 'packingList');
-  };
-
+  const setPackingList = (data: PackingItem[]) => { setPackingListState(data); persist(STORAGE_KEYS.PACKING, data, 'packingList'); };
+  
   const togglePackingItem = (id: string) => {
     const newData = packingList.map(item => item.id === id ? { ...item, checked: !item.checked } : item);
     setPackingList(newData);
   };
 
-  const setMemoList = (data: PackingItem[]) => {
-    setMemoListState(data);
-    persist(STORAGE_KEYS.MEMO, data, 'memoList');
-  };
-
+  const setMemoList = (data: PackingItem[]) => { setMemoListState(data); persist(STORAGE_KEYS.MEMO, data, 'memoList'); };
+  
   const addMemoItem = (item: PackingItem) => {
     const newData = [...memoList, item];
     setMemoList(newData);
@@ -317,11 +356,8 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     setMemoList(newData);
   };
 
-  const setWishList = (data: PackingItem[]) => {
-    setWishListState(data);
-    persist(STORAGE_KEYS.WISH, data, 'wishList');
-  };
-
+  const setWishList = (data: PackingItem[]) => { setWishListState(data); persist(STORAGE_KEYS.WISH, data, 'wishList'); };
+  
   const addWishItem = (item: PackingItem) => {
     const newData = [...wishList, item];
     setWishList(newData);
@@ -337,7 +373,6 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     setWishList(newData);
   };
 
-  // Photos (Plan View)
   const uploadPhoto = (key: string, base64: string) => {
       const newPhotos = { ...photos, [key]: base64 };
       setPhotosState(newPhotos);
@@ -351,7 +386,7 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       persist(STORAGE_KEYS.PHOTOS, newPhotos, 'photos');
   };
 
-  // Export / Import (Local based)
+  // Export / Import
   const exportData = () => {
     const data: Record<string, any> = {
       [STORAGE_KEYS.ITINERARY]: itinerary,
@@ -375,26 +410,24 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   };
 
   const importData = (jsonString: string): boolean => {
-    try {
-      const data = JSON.parse(jsonString);
-      if (typeof data !== 'object') return false;
-
-      // When importing, we set states which triggers persist()
-      if (data[STORAGE_KEYS.ITINERARY]) setItinerary(data[STORAGE_KEYS.ITINERARY]);
-      if (data[STORAGE_KEYS.BOOKINGS]) setBookings(data[STORAGE_KEYS.BOOKINGS]);
-      if (data[STORAGE_KEYS.GUIDES]) setGuideSpots(data[STORAGE_KEYS.GUIDES]);
-      if (data[STORAGE_KEYS.PACKING]) setPackingList(data[STORAGE_KEYS.PACKING]);
-      if (data[STORAGE_KEYS.MEMO]) setMemoList(data[STORAGE_KEYS.MEMO]);
-      if (data[STORAGE_KEYS.WISH]) setWishList(data[STORAGE_KEYS.WISH]);
-      if (data[STORAGE_KEYS.PHOTOS]) {
-          setPhotosState(data[STORAGE_KEYS.PHOTOS]);
-          persist(STORAGE_KEYS.PHOTOS, data[STORAGE_KEYS.PHOTOS], 'photos');
+      try {
+          const data = JSON.parse(jsonString);
+          
+          if (data[STORAGE_KEYS.ITINERARY]) setItinerary(data[STORAGE_KEYS.ITINERARY]);
+          if (data[STORAGE_KEYS.BOOKINGS]) setBookings(data[STORAGE_KEYS.BOOKINGS]);
+          if (data[STORAGE_KEYS.GUIDES]) setGuideSpots(data[STORAGE_KEYS.GUIDES]);
+          if (data[STORAGE_KEYS.PACKING]) setPackingList(data[STORAGE_KEYS.PACKING]);
+          if (data[STORAGE_KEYS.MEMO]) setMemoList(data[STORAGE_KEYS.MEMO]);
+          if (data[STORAGE_KEYS.WISH]) setWishList(data[STORAGE_KEYS.WISH]);
+          if (data[STORAGE_KEYS.PHOTOS]) {
+              setPhotosState(data[STORAGE_KEYS.PHOTOS]);
+              persist(STORAGE_KEYS.PHOTOS, data[STORAGE_KEYS.PHOTOS], 'photos');
+          }
+          return true;
+      } catch (e) {
+          console.error("Import Error:", e);
+          return false;
       }
-      return true;
-    } catch (e) {
-      console.error(e);
-      return false;
-    }
   };
 
   return (
@@ -407,8 +440,6 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       wishList, setWishList, addWishItem, deleteWishItem, toggleWishItem,
       photos, uploadPhoto, removePhoto,
       exportData, importData, isLoading, error,
-      
-      // Cloud
       isCloudMode, cloudConfig, connectToCloud, disconnectCloud, connectionStatus
     }}>
       {children}
@@ -418,7 +449,7 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
 
 export const useTripContext = () => {
   const context = useContext(TripContext);
-  if (!context) {
+  if (context === undefined) {
     throw new Error('useTripContext must be used within a TripProvider');
   }
   return context;
