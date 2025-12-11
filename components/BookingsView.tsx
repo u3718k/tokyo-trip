@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { BookingItem, BookingType } from '../types';
 import { Plane, BedDouble, Utensils, MapPin, Clock, Users, ExternalLink, Lock, Unlock, Trash2, Plus, X, Calendar, Upload, Camera, AlertTriangle } from 'lucide-react';
 import { useTripContext } from '../contexts/TripContext';
+import { compressImage } from '../contexts/TripContext'; // Import helper
 
 const PIN_CODE = '0000';
 
@@ -78,11 +79,16 @@ const BookingsView: React.FC<Props> = ({ highlightId }) => {
     const file = e.target.files?.[0];
     if (file && photoTargetId) {
       const reader = new FileReader();
-      reader.onloadend = () => {
-        const result = reader.result as string;
-        updateBookingPhoto(photoTargetId, result);
-        setPhotoTargetId(null);
-        if (fileInputRef.current) fileInputRef.current.value = '';
+      reader.onloadend = async () => {
+        const rawBase64 = reader.result as string;
+        try {
+            const compressed = await compressImage(rawBase64);
+            updateBookingPhoto(photoTargetId, compressed);
+            setPhotoTargetId(null);
+            if (fileInputRef.current) fileInputRef.current.value = '';
+        } catch(e) {
+            alert("圖片處理失敗");
+        }
       };
       reader.readAsDataURL(file);
     }
@@ -452,16 +458,17 @@ const AddBookingModal: React.FC<{ onClose: () => void, onSave: (item: BookingIte
   
   const [isConfirming, setIsConfirming] = useState(false);
   
-  const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
       const reader = new FileReader();
-      reader.onloadend = () => {
-        const result = reader.result as string;
+      reader.onloadend = async () => {
+        const rawBase64 = reader.result as string;
         try {
-            setImageFile(result);
+            const compressed = await compressImage(rawBase64);
+            setImageFile(compressed);
         } catch (error) {
-            alert("圖片過大！");
+            alert("圖片處理失敗！");
         }
       };
       reader.readAsDataURL(file);
@@ -597,7 +604,7 @@ const AddBookingModal: React.FC<{ onClose: () => void, onSave: (item: BookingIte
             </div>
 
             <div>
-                <label className="block text-xs font-bold text-stone-500 mb-1">圖片</label>
+                <label className="block text-xs font-bold text-stone-500 mb-1">圖片 (自動壓縮)</label>
                 <label className="flex items-center gap-3 p-3 rounded-xl border border-dashed border-stone-300 bg-stone-50 cursor-pointer hover:bg-stone-100">
                     <Upload size={20} className="text-stone-400" />
                     <span className="text-sm text-stone-500 truncate">{imageFile ? '圖片已載入' : '上傳圖片'}</span>
