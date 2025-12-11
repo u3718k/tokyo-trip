@@ -130,8 +130,16 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   // --- Utility: Get Bucket for Date ---
   const getGuideBucket = (dateStr?: string): string => {
       if (!dateStr) return 'misc';
-      // dateStr format: '12/17' or '2025/12/17'
-      const clean = dateStr.replace('2025/', '').replace('/', ''); // '1217'
+      // Normalize: '2025-12-17' -> '1217', '12/17' -> '1217'
+      let clean = dateStr
+          .replace('2025/', '')
+          .replace('2025-', '')
+          .replace('/', '')
+          .replace('-', ''); // Remove separators and year
+
+      // Extract last 4 chars if longer (e.g. 1217)
+      if (clean.length > 4) clean = clean.slice(-4);
+      
       if (GUIDE_BUCKETS.includes(clean)) return clean;
       return 'misc';
   };
@@ -176,6 +184,10 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
           // 2. Initialize Firestore
           const db = getFirestore(app);
           dbRef.current = db;
+
+          // Reset Chunks on Connect
+          guideChunksRef.current = {};
+          GUIDE_BUCKETS.forEach(b => guideChunksRef.current[b] = []);
 
           const unsubs: (() => void)[] = [];
 
@@ -234,7 +246,7 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
                  setDoc(mainRef, { 
                     itinerary: sanitizeForFirestore(itinerary), 
                     packingList, memoList, wishList 
-                 }).catch(err => setError(`建立資料失敗: ${err.message}`));
+                 }, { merge: true }).catch(err => setError(`建立資料失敗: ${err.message}`));
              }
              setConnectionStatus('connected');
              setIsCloudMode(true);
@@ -250,7 +262,7 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
                   const data = docSnap.data();
                   if (data.bookings) setBookingsState(data.bookings);
               } else {
-                  setDoc(bookingsRef, { bookings: sanitizeForFirestore(bookings) }).catch(console.error);
+                  setDoc(bookingsRef, { bookings: sanitizeForFirestore(bookings) }, { merge: true }).catch(console.error);
               }
           }, (err) => console.warn("Bookings sync error:", err.message));
           unsubs.push(unsubBookings);
@@ -262,7 +274,7 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
                   const data = docSnap.data();
                   if (data.photos) setPhotosState(data.photos);
               } else {
-                  setDoc(photosRef, { photos: {} }).catch(console.error);
+                  setDoc(photosRef, { photos: {} }, { merge: true }).catch(console.error);
               }
           }, (err) => console.warn("Photos sync error:", err.message));
           unsubs.push(unsubPhotos);
@@ -346,6 +358,7 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         unsubscribeRef.current();
         unsubscribeRef.current = null;
     }
+    guideChunksRef.current = {}; // Clear chunks on disconnect
     setConnectionStatus('disconnected');
     setIsCloudMode(false);
   };
@@ -382,7 +395,8 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
                   // Write all buckets (using setDoc to overwrite array for that day)
                   const writePromises = Object.entries(buckets).map(([bKey, items]) => {
                        const docRef = doc(dbRef.current!, 'trips', `${GUIDE_DOC_PREFIX}${bKey}`);
-                       // If items empty, we still write empty array to clear if needed
+                       // Using setDoc without merge because we want to overwrite the list for this bucket
+                       // This handles deletions correctly
                        return setDoc(docRef, { guideSpots: items });
                   });
                   
@@ -399,7 +413,9 @@ export const TripProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
                   // For Main doc, protect against jitter
                   if (targetDocId === DOC_MAIN) ignoreNextSnapshot.current = true;
                   
-                  await updateDoc(docRef, { [fieldName]: cleanData });
+                  // Use setDoc with merge: true instead of updateDoc
+                  // This ensures the document is created if it doesn't exist (e.g., syncing from a new device)
+                  await setDoc(docRef, { [fieldName]: cleanData }, { merge: true });
               }
 
               if (error && error.includes('失敗')) setError(null);
